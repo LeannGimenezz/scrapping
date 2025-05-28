@@ -1,209 +1,266 @@
 const express = require('express');
 const { chromium } = require('playwright');
-// const fs = require('fs'); // Ya no es necesario para el endpoint, a menos que quieras guardar localmente además de responder
 
 const app = express();
-const PORT = process.env.PORT || 3000; // Puerto configurable, default 3000
+const PORT = process.env.PORT || 3000;
 
-// La función de scraping, adaptada para ser llamada y retornar datos
 async function scrapePencyDisglutenfree() {
   console.log('Iniciando scraping...');
-  const browser = await chromium.launch({
-    headless: true, // RECOMENDADO para servidores. Cambia a false para depurar localmente.
-    args: [
-      '--no-sandbox', // Necesario para muchos entornos de despliegue (Docker, etc.)
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage', // Evita problemas con memoria compartida limitada
-      '--disable-accelerated-2d-canvas',
-      '--no-first-run',
-      '--no-zygote',
-      // '--single-process', // Desaconsejado en general, pero a veces necesario
-      '--disable-gpu'
-    ]
-  });
-  const page = await browser.newPage();
-  const data = [];
+  let browser;
 
   try {
+    browser = await chromium.launch({
+      headless: true, // Cambia a false para depuración local y ver el navegador
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--disable-gpu',
+      ],
+    });
+
+    const context = await browser.newContext({
+      // Puedes añadir un user-agent más común si es necesario
+      // userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/98.0.4758.102 Safari/537.36',
+      viewport: { width: 1280, height: 1024 } // Un viewport razonable
+    });
+    const page = await context.newPage();
+    const data = [];
+
     console.log('Navegando a https://pency.app/disglutenfree');
-    await page.goto('https://pency.app/disglutenfree', { waitUntil: 'networkidle', timeout: 60000 }); // Esperar a que la red esté más tranquila
+    await page.goto('https://pency.app/disglutenfree', {
+      waitUntil: 'networkidle',
+      timeout: 90000,
+    });
 
+    // Manejo del modal de bienvenida
     try {
-      console.log('Intentando cerrar modal...');
-      // Aumentar timeout y ser más específico si es posible
-      await page.waitForSelector('button[data-test-id="product-onboarding-close"]', { timeout: 5000 });
-      await page.click('button[data-test-id="product-onboarding-close"]');
-      console.log('Modal cerrado correctamente.');
+      console.log('Intentando cerrar modal de bienvenida...');
+      const modalCloseButton = 'button[data-test-id="product-onboarding-close"]';
+      await page.waitForSelector(modalCloseButton, { timeout: 10000 }); // Aumentamos un poco la espera
+      await page.click(modalCloseButton);
+      console.log('Modal de bienvenida cerrado correctamente.');
     } catch (e) {
-      console.log('No apareció el modal o no se pudo cerrar, continuando...');
+      console.log('No apareció el modal de bienvenida o no se pudo cerrar, continuando...');
     }
 
-    console.log('Haciendo scroll para cargar contenido...');
-    // Scroll más robusto para lazy loading
+    // Scroll mejorado para cargar todo el contenido (lazy loading)
+    console.log('Realizando scroll para cargar todo el contenido...');
     let previousHeight;
-    for (let i = 0; i < 10; i++) { // Intentar scrollear varias veces
-        previousHeight = await page.evaluate('document.body.scrollHeight');
-        await page.evaluate('window.scrollTo(0, document.body.scrollHeight)');
-        await page.waitForTimeout(1500); // Esperar a que cargue el contenido
-        let newHeight = await page.evaluate('document.body.scrollHeight');
-        if (newHeight === previousHeight) break; // Si no hay más scroll, salir
+    for (let i = 0; i < 20; i++) { // Aumentar un poco el número de intentos de scroll
+      previousHeight = await page.evaluate('document.body.scrollHeight');
+      await page.evaluate('window.scrollTo(0, document.body.scrollHeight)');
+      await page.waitForTimeout(2000 + Math.random() * 1000); // Espera entre 2 y 3 segundos
+      let newHeight = await page.evaluate('document.body.scrollHeight');
+      if (newHeight === previousHeight) {
+        console.log('Scroll completado, no más contenido cargado.');
+        break;
+      }
+      console.log(`Scroll ${i + 1}, altura previa: ${previousHeight}, altura nueva: ${newHeight}`);
+      if (i === 19) console.log('Se alcanzó el límite de intentos de scroll.');
     }
-    // O el original si funciona bien:
-    // await page.waitForTimeout(100);
-    // await page.mouse.wheel(0, 15000); // Un poco más de scroll
-    // await page.waitForTimeout(2000); // Más tiempo para cargar después del scroll
 
     console.log('Buscando contenedores de categoría...');
+    // Esperar un poco a que los contenedores se estabilicen después del scroll
+    await page.waitForTimeout(1000);
     const categoryContainers = await page.$$('.css-a6fk9l, .css-xyh1ff');
     console.log(`Se encontraron ${categoryContainers.length} contenedores de categoría.`);
 
     for (let i = 0; i < categoryContainers.length; i++) {
       const container = categoryContainers[i];
-      const categoriaData = { categoria: `Categoría Desconocida ${i + 1}`, productos: [] };
+      let nombreCategoria = `Categoría Desconocida ${i + 1}`;
 
       try {
         const tituloCategoriaElement = await container.$('p.css-18v1jhz');
         if (tituloCategoriaElement) {
-          categoriaData.categoria = await tituloCategoriaElement.innerText();
+          nombreCategoria = await tituloCategoriaElement.innerText();
         }
+        console.log(`Procesando categoría (${i+1}/${categoryContainers.length}): "${nombreCategoria}"`);
 
         const svgIcon = await container.$('svg.feather-chevron-down');
         if (svgIcon) {
-          console.log(`Intentando expandir categoría: "${categoriaData.categoria}"`);
+          console.log(`Intentando expandir categoría: "${nombreCategoria}"`);
           await svgIcon.scrollIntoViewIfNeeded();
-          await page.waitForTimeout(200); // Pequeña pausa antes de clickear
-          await svgIcon.click();
-          console.log(`Categoría "${categoriaData.categoria}" clickeada para expandir.`);
-          await page.waitForTimeout(1000); // Esperar a que los productos aparezcan
+          await page.waitForTimeout(500 + Math.random() * 500); // Pausa antes del click
 
-          // Volver a seleccionar los productos DESPUÉS de expandir la categoría,
-          // idealmente dentro del contexto del contenedor de la categoría actual si es posible.
-          // Esta selección es global, podría ser un problema si la estructura es muy anidada.
-          // Si '.css-xxs8cq' es el selector de producto DENTRO de la categoría expandida,
-          // podrías hacer `container.$$('.css-xxs8cq')` si la estructura lo permite.
-          // Por ahora, mantenemos la lógica original de buscar productos globalmente tras el click.
-          // Si las categorías no se "colapsan" al abrir otra, esto podría funcionar.
-          // Si se colapsan, necesitarías raspar productos *inmediatamente* después de expandir *esta* categoría.
+          // --- INICIO DE LA LÓGICA DE CLICK MEJORADA ---
+          try {
+            // Intenta primero un click normal con un timeout razonable
+            console.log(`   Intentando click normal en SVG de "${nombreCategoria}"...`);
+            await svgIcon.click({ timeout: 15000 }); // Aumentar un poco el timeout para el click normal
+            console.log(`   ✓ Click normal en SVG de "${nombreCategoria}" exitoso.`);
+          } catch (clickError) {
+            console.warn(`   ⚠️ Click normal en SVG de "${nombreCategoria}" falló: ${clickError.message.split('\n')[0]}`); // Mensaje más corto
+            console.log(`   Intentando click con JavaScript en SVG de "${nombreCategoria}" como fallback...`);
+            try {
+                await svgIcon.evaluate(node => node.click());
+                console.log(`   ✓ Click con JavaScript en SVG de "${nombreCategoria}" exitoso.`);
+            } catch (jsClickError) {
+                console.error(`   ❌ Click con JavaScript en SVG de "${nombreCategoria}" TAMBIÉN FALLÓ: ${jsClickError.message}`);
+                // Si ambos fallan, podríamos forzarlo, o simplemente loguear y continuar
+                // await svgIcon.click({ force: true, timeout: 5000 });
+                // console.log(`   Intentando click forzado tras fallo de JS...`);
+                throw jsClickError; // Relanzar el error si el click JS falla para que se capture en el catch de la categoría
+            }
+          }
+          // --- FIN DE LA LÓGICA DE CLICK MEJORADA ---
 
+          console.log(`Categoría "${nombreCategoria}" interacción de expansión completada.`);
+          // Esperar a que los productos se carguen/actualicen después de expandir
+          await page.waitForTimeout(2000 + Math.random() * 1500); // Aumentar ligeramente esta espera
         } else {
-          console.log(`No se encontró el ícono para expandir en "${categoriaData.categoria}".`);
-          // Si no hay ícono, quizás los productos ya están visibles o es una categoría sin sub-elementos clickeables.
+          console.log(`No se encontró el ícono para expandir en "${nombreCategoria}". Productos podrían estar ya visibles o ser una categoría sin expansión.`);
         }
 
-        // Recolectar productos para ESTA categoría (o los visibles en ese momento)
-        // Es importante que el selector '.css-xxs8cq' sea para productos *dentro* de la categoría expandida
-        // o que los productos se carguen de forma que sean distinguibles.
-        // Para ser más robusto, sería mejor hacer:
-        // const productosElements = await container.$$('.css-xxs8cq');
-        // Pero si los productos no están anidados directamente bajo 'container', la selección global es necesaria.
-
-        // Asumimos que los productos cargados son los de la última categoría expandida
-        // ESTO ES UNA ASUNCIÓN CRÍTICA. Si varias categorías se abren y los productos
-        // no se cargan de forma aislada por categoría, esto mezclará productos.
-        // Una mejora sería hacer `await container.$$('.css-xxs8cq')` si los productos están anidados.
+        // Lógica para recolectar productos de la categoría actual
+        // IMPORTANTE: Esta parte asume que los productos .css-xxs8cq que aparecen son los de la categoría
+        // recién interactuada. Si no es así, se necesitaría una lógica más sofisticada
+        // para aislar los productos de *esta* categoría (ej. usando container.locator(...))
         const productosElements = await page.$$('.css-xxs8cq');
-        console.log(`→ Se encontraron ${productosElements.length} elementos de producto tras interactuar con "${categoriaData.categoria}"`);
+        console.log(`→ Buscando productos en página tras interactuar con "${nombreCategoria}". Encontrados globalmente: ${productosElements.length}`);
         const productosCategoria = [];
 
         for (const productoEl of productosElements) {
+          // Podrías añadir una comprobación aquí para ver si el productoEl está realmente DENTRO del 'container' actual,
+          // si la estructura HTML lo permite y si la selección global de productos es demasiado amplia.
+          // Ejemplo: const isDescendant = await productoEl.evaluate((el, catContainer) => catContainer.contains(el), container);
+          // if (!isDescendant) continue;
+
           const contenedorInfo = await productoEl.$('.css-1nqnvtt');
-          if (!contenedorInfo) continue;
-
-          const ps = await contenedorInfo.$$('p');
-          const nombre = ps[0] ? await ps[0].innerText() : 'Sin nombre';
-          const descripcion = ps[1] ? await ps[1].innerText() : 'Sin descripción';
-
-          const precioElement = await productoEl.$('p.css-lb7l61');
-          const precio = precioElement ? await precioElement.innerText() : 'Sin precio';
-
-          let stock = 'No especificado';
-          const stockDisponible = await productoEl.$('p.css-11cvmn9');
-          const sinStock = await productoEl.$('.css-a8b72n'); // p.css-a8b72n según tu script original
-
-          if (stockDisponible) {
-            stock = await stockDisponible.innerText();
-          } else if (sinStock) {
-            stock = 'Sin stock';
-          } else {
-            // Podría haber un estado intermedio o simplemente estar disponible sin texto específico
-            stock = 'Stock disponible (o no indicado explícitamente)';
+          if (!contenedorInfo) {
+            // console.log("Producto omitido: No se encontró .css-1nqnvtt");
+            continue;
           }
 
-          // Lógica de imagen (aún comentada como en tu original)
-          // let imagen = 'Sin imagen';
-          // const posiblesDivsImagen = await productoEl.$$('div[style*="background-image"]'); // Ejemplo
-          // if (posiblesDivsImagen.length > 0) {
-          //    const style = await posiblesDivsImagen[0].getAttribute('style');
-          //    const match = style.match(/url\("?(.*?)"?\)/);
-          //    if (match && match[1]) imagen = match[1];
-          // }
+          const ps = await contenedorInfo.$$('p');
+          const nombre = ps[0] ? (await ps[0].innerText()).trim() : 'Sin nombre';
+          const descripcion = ps[1] ? (await ps[1].innerText()).trim() : 'Sin descripción';
+
+          const precioElement = await productoEl.$('p.css-lb7l61');
+          const precio = precioElement ? (await precioElement.innerText()).trim() : 'Sin precio';
+
+          let stock = 'No especificado';
+          const stockDisponible = await productoEl.$('p.css-11cvmn9'); // Texto como "XX unidades disponibles"
+          const sinStockElement = await productoEl.$('p.css-a8b72n');    // Texto como "Sin stock"
+
+          if (stockDisponible) {
+            stock = (await stockDisponible.innerText()).trim();
+          } else if (sinStockElement) {
+            const sinStockText = (await sinStockElement.innerText()).trim();
+            if (sinStockText.toLowerCase().includes('sin stock') || sinStockText.toLowerCase().includes('agotado')) {
+              stock = 'Sin stock';
+            } else {
+              stock = sinStockText; // Usar el texto tal cual si no es "Sin stock"
+              console.log(`   Texto de stock no reconocido en .css-a8b72n para "${nombre}": "${stock}"`);
+            }
+          } else {
+            stock = 'Stock disponible (implícito)';
+          }
+
+          let imagen = 'Sin imagen';
+          // Intenta buscar un div con background-image (ejemplo, ajustar selector)
+          const divImagen = await productoEl.$('div[style*="background-image"]');
+          if (divImagen) {
+            const style = await divImagen.getAttribute('style');
+            if (style) {
+                const match = style.match(/url\("?(.*?)"?\)/);
+                if (match && match[1]) {
+                    imagen = match[1];
+                }
+            }
+          } else {
+            // O intenta buscar una etiqueta img (ejemplo, ajustar selector)
+            const imgTag = await productoEl.$('img');
+            if (imgTag) {
+                imagen = await imgTag.getAttribute('src') || 'Src no encontrado en img';
+            }
+          }
+
 
           productosCategoria.push({
             nombre,
             descripcion,
             precio,
-            stock
-            // imagen
+            stock,
+            imagen,
           });
         }
-        categoriaData.productos = productosCategoria;
 
+        if (productosCategoria.length > 0) {
+            data.push({
+              categoria: nombreCategoria,
+              productos: productosCategoria,
+            });
+            console.log(`✓ Categoría "${nombreCategoria}" procesada con ${productosCategoria.length} productos.`);
+        } else {
+            console.log(`⚠️ No se encontraron productos para la categoría "${nombreCategoria}" con los selectores actuales, o la lógica de asociación falló.`);
+            // Opcional: añadir entrada vacía para saber que se intentó
+            data.push({
+                categoria: nombreCategoria,
+                productos: [],
+                nota: "No se encontraron productos o fallo en asociación"
+            });
+        }
 
       } catch (err) {
-        console.error(`Error procesando la categoría "${categoriaData.categoria}":`, err.message);
-        // Continuar con la siguiente categoría
+        console.error(`❌ Error procesando la categoría "${nombreCategoria}" (índice ${i}):`, err.message, err.stack.substring(0, 300));
+        data.push({
+          categoria: nombreCategoria,
+          productos: [],
+          error: `Error al procesar: ${err.message}`,
+        });
       }
-      data.push(categoriaData); // Agrega la categoría y sus productos (o un array vacío si falló)
-      // console.log(JSON.stringify(categoriaData, null, 2)); // Log por categoría
-    }
+    } // FIN DEL BUCLE DE CATEGORÍAS
+
+    console.log('Scraping principal completado.');
+    return data;
 
   } catch (error) {
-    console.error('Error durante el proceso de scraping:', error);
-    // Propagar el error para que el endpoint pueda devolver un 500
-    await browser.close(); // Asegurar que el navegador se cierre en caso de error
+    console.error('Error general durante el proceso de scraping:', error);
     throw error;
+  } finally {
+    if (browser) {
+      console.log('Cerrando el navegador.');
+      await browser.close();
+    }
   }
-
-  console.log('Cerrando el navegador.');
-  await browser.close();
-  console.log('Scraping completado. Datos recolectados:', data.length, "categorías");
-  return data;
 }
 
 // Endpoint GET para ejecutar el scraping
-app.get('/scrape-pency', async (req, res) => {
+app.get('/api/scrapping', async (req, res) => {
   try {
-    console.log('Solicitud recibida en /scrape-pency');
+    console.log(`Solicitud recibida en ${req.path}`);
     const scrapedData = await scrapePencyDisglutenfree();
 
-    // Opcional: Guardar en archivo si aún lo necesitas
-    /*
-    const baseName = 'productos_scraped';
-    const extension = '.json';
-    let filename = `${baseName}${extension}`;
-    fs.writeFileSync(filename, JSON.stringify(scrapedData, null, 2));
-    console.log(`Archivo "${filename}" guardado localmente.`);
-    */
+    if (scrapedData && scrapedData.length > 0) {
+        res.json(scrapedData);
+    } else {
+        console.log("No se devolvieron datos o los datos estaban vacíos.");
+        res.status(404).json({ message: "No se encontraron datos o el scraping no produjo resultados." });
+    }
 
-    res.json(scrapedData);
   } catch (error) {
-    console.error("Error en el endpoint /scrape-pency:", error);
-    res.status(500).json({
-      error: 'Falló el scraping.',
-      details: error.message,
-      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
-    });
+    if (!res.headersSent) {
+      console.error(`Error en el endpoint ${req.path}:`, error.message);
+      res.status(500).json({
+        error: 'Falló el scraping.',
+        details: error.message,
+        stack: process.env.NODE_ENV === 'development' ? error.stack : undefined,
+      });
+    }
   }
 });
 
-// Endpoint de prueba
 app.get('/', (req, res) => {
-  res.send('Servidor de scraping funcionando. Prueba el endpoint /scrape-pency');
+  res.send(`Servidor de scraping funcionando. Accede a /api/scrapping para obtener los datos.`);
 });
 
 app.listen(PORT, () => {
   console.log(`Servidor escuchando en http://localhost:${PORT}`);
   if (process.env.NODE_ENV !== 'production') {
-      console.log(`Prueba el endpoint en: http://localhost:${PORT}/scrape-pency`);
+    console.log(`Prueba el endpoint de scraping en: http://localhost:${PORT}/api/scrapping`);
   }
 });
